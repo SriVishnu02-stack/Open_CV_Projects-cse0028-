@@ -1,0 +1,199 @@
+# Real-Time Geometric Shape Detection, Automated Quality Inspection and Production Monitoring System Using OpenCV
+
+## Overview
+
+This project was developed to demonstrate how computer vision can be applied to automate quality inspection in a manufacturing environment. The system uses Python and OpenCV to detect geometric shapes in real time, identify their colors, compare manufactured components with a reference image, and determine whether they satisfy predefined quality standards.
+
+In addition to shape detection, the project includes object tracking, defect detection, production monitoring, CSV report generation, and automatic storage of defective part images. The objective was to build a practical prototype that reflects the basic workflow followed in industrial visual inspection systems.
+
+## Features
+
+- Real-time detection of multiple geometric shapes
+- Color identification using the HSV color space
+- Human detection using OpenCV's Haar Cascade classifier
+- Object tracking with unique IDs
+- Automated quality inspection using a reference image
+- Detection of manufacturing defects
+- PASS/FAIL classification
+- Live production dashboard
+- Automatic CSV report generation
+- Automatic saving of defective product images
+- Contour difference visualization for defect analysis
+
+## Supported Shapes
+
+The system can identify the following shapes:
+
+- Triangle
+- Square
+- Rectangle
+- Circle
+- Pentagon
+- Hexagon
+- Diamond
+- Heart
+- Star
+
+## How It Works
+
+The application captures live video from a webcam and processes each frame using a sequence of computer vision techniques.
+
+The processing pipeline consists of:
+
+1. Capture the live image.
+2. Convert the image to grayscale.
+3. Apply Gaussian Blur to reduce noise.
+4. Detect object edges using the Canny Edge Detector.
+5. Find contours of detected objects.
+6. Identify the geometric shape and object color.
+7. Track detected objects.
+8. Compare manufactured parts with a reference object.
+9. Detect any defects or dimensional differences.
+10. Classify the part as PASS or FAIL.
+11. Update the production dashboard and generate inspection reports.
+
+## Quality Inspection
+
+The quality inspection module compares every manufactured component with a previously selected reference component.
+
+The comparison includes:
+
+- Shape verification
+- Size comparison
+- Number of vertices
+- Number of holes
+- Solidity comparison
+- Contour similarity
+
+If the inspected component satisfies all predefined conditions, it is marked as PASS. Otherwise, it is marked as FAIL, and the detected defect is recorded.
+
+## Defects Detected
+
+The system is capable of identifying several common manufacturing defects, including:
+
+- Shape mismatch
+- Missing corners
+- Broken edges
+- Extra material
+- Missing material
+- Additional holes
+- Missing holes
+- Incorrect dimensions
+- Deformed components
+
+## Production Dashboard
+
+During inspection, the system continuously displays:
+
+- Total inspected components
+- Number of accepted components
+- Number of rejected components
+- Production efficiency
+
+This provides a quick overview of the inspection process in real time.
+
+## Report Generation
+
+For every inspected component, the system automatically creates a CSV report containing:
+
+- Date and time
+- Shape
+- Color
+- Inspection result
+- Defect description
+- Image location
+
+Whenever a defective component is detected, the corresponding inspection image and contour comparison image are also saved automatically.
+
+## Technologies Used
+
+- Python
+- OpenCV
+- NumPy
+- Tkinter
+- CSV Module
+
+## Installation
+
+Clone the repository:
+
+```bash
+git clone https://github.com/SriVishnu02-stack/Open_CV_Projects-cse0028-.git
+```
+
+Install the required packages:
+
+```bash
+pip install opencv-python numpy
+```
+
+Run the project:
+
+```bash
+python shape_detection_qc.py
+```
+
+## Keyboard Controls
+
+| Key | Function |
+|------|----------|
+| A | Detect all shapes |
+| T | Triangle |
+| S | Square |
+| R | Rectangle |
+| P | Pentagon |
+| C | Circle |
+| D | Diamond |
+| H | Heart |
+| U | Human Detection |
+| Shift + R | Select reference image |
+| Shift + C | Compare manufactured part |
+| Q | Exit the application |
+
+## Project Structure
+
+```text
+Project
+│
+├── shape_detection_qc.py
+├── qc_report.csv
+├── defects/
+├── README.md
+```
+
+## Applications
+
+- Manufacturing quality inspection
+- Industrial automation
+- Production monitoring
+- Smart factory systems
+- Robotics
+- Packaging inspection
+- Educational computer vision demonstrations
+
+## Future Improvements
+
+- Deep learning-based defect detection
+- Conveyor belt integration
+- Barcode and QR code inspection
+- Cloud-based production monitoring
+- IoT integration
+- Robotic arm integration
+
+## About the Project
+
+This project was developed as part of an academic computer vision project to understand how image processing techniques can be applied to solve practical industrial problems. While it is a prototype, it demonstrates the fundamental concepts behind automated visual inspection systems used in modern manufacturing industries.
+
+## Author
+
+M. Sri Vishnu Vardhan
+
+Roll Number: 2401100CSE0028
+
+Department of Computer Science and Engineering
+
+Sreenidhi University
+
+## License
+
+This project is intended for educational and learning purposes.
