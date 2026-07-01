@@ -1,0 +1,926 @@
+import cv2
+import numpy as np
+import platform
+import math
+import csv
+import os
+from datetime import datetime
+import tkinter as tk
+from tkinter import filedialog
+
+# ----------------------------------------------------
+# CONFIG / CONSTANTS
+# ----------------------------------------------------
+
+MIN_CONTOUR_AREA = 1500
+MAX_CONTOUR_AREA_RATIO = 0.95
+MIN_HOLE_AREA = 80                  # ignore tiny noise specks when counting holes
+
+APPROX_EPSILON_RATIO = 0.04
+
+SQUARE_ASPECT_LOW = 0.95
+SQUARE_ASPECT_HIGH = 1.05
+
+SOLIDITY_CIRCLE = 0.92
+SOLIDITY_HEART_LOW = 0.70
+
+CANNY_LOW = 30
+CANNY_HIGH = 100
+
+FACE_SCALE_FACTOR = 1.1
+FACE_MIN_NEIGHBORS = 12
+FACE_MIN_SIZE = (100, 100)
+
+MAX_UPLOADED_IMAGE_DIM = 1000
+
+# QC tolerances
+SIZE_TOLERANCE_PERCENT = 2.0
+VERTEX_DIFF_TOLERANCE = 1            # allowed difference in corner count
+SOLIDITY_DROP_TOLERANCE = 0.08       # allowed drop in solidity before "deformed"
+SHAPE_DIFF_TOLERANCE = 0.015         # max allowed non-overlapping outline area (after
+                                      # centroid-aligning ref & test contours) before flagging
+                                      # a structural/local shape defect (notch, chip, extra tab...).
+                                      # Tuned so normal camera/segmentation jitter (~0.5-1%) passes
+                                      # but small real notches/chips (~1.5%+) get caught. If you get
+                                      # false positives from lighting/angle noise, raise slightly;
+                                      # if small defects are slipping through, lower it.
+SHAPE_DIFF_CANVAS = 700              # size of the square canvas used to rasterize/compare contours
+
+# Real-world unit calibration (set when reference is captured)
+PIXELS_PER_UNIT = None               # px per cm, once calibrated
+UNIT_NAME = "cm"
+
+# File outputs
+DEFECT_DIR = "defects"
+CSV_PATH = "qc_report.csv"
+
+KEY_TO_SHAPE = {
+    'a': "All", 't': "Triangle", 's': "Square", 'r': "Rectangle",
+    'p': "Pentagon", 'c': "Circle", 'd': "Diamond", 'h': "Heart",
+    '*': "Star", '8': "Star", 'u': "Human",
+}
+
+# ----------------------------------------------------
+# PRODUCTION COUNTER (session-wide dashboard state)
+# ----------------------------------------------------
+production_stats = {"total": 0, "pass": 0, "fail": 0}
+
+def record_result(passed):
+    production_stats["total"] += 1
+    production_stats["pass" if passed else "fail"] += 1
+
+def efficiency_percent():
+    if production_stats["total"] == 0:
+        return 100.0
+    return (production_stats["pass"] / production_stats["total"]) * 100.0
+
+# ----------------------------------------------------
+# CSV REPORT LOGGING
+# ----------------------------------------------------
+def init_csv_report():
+    if not os.path.exists(CSV_PATH):
+        with open(CSV_PATH, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Time", "Shape", "Color", "Result", "Reasons", "ImagePath"])
+
+def log_csv_row(shape, color, result, reasons, image_path=""):
+    init_csv_report()
+    with open(CSV_PATH, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            shape, color, result, "; ".join(reasons), image_path
+        ])
+
+def save_defect_screenshot(img):
+    os.makedirs(DEFECT_DIR, exist_ok=True)
+    idx = production_stats["fail"]
+    path = os.path.join(DEFECT_DIR, f"defect_{idx}.png")
+    cv2.imwrite(path, img)
+    return path
+
+# ----------------------------------------------------
+# UI HELPER FUNCTIONS
+# ----------------------------------------------------
+def draw_target_box(img, x, y, w, h, color=(0, 255, 255)):
+    length = int(w * 0.2)
+    thickness = 3
+    cv2.line(img, (x, y), (x + length, y), color, thickness, cv2.LINE_AA)
+    cv2.line(img, (x, y), (x, y + length), color, thickness, cv2.LINE_AA)
+    cv2.line(img, (x + w, y), (x + w - length, y), color, thickness, cv2.LINE_AA)
+    cv2.line(img, (x + w, y), (x + w, y + length), color, thickness, cv2.LINE_AA)
+    cv2.line(img, (x, y + h), (x + length, y + h), color, thickness, cv2.LINE_AA)
+    cv2.line(img, (x, y + h), (x, y + h - length), color, thickness, cv2.LINE_AA)
+    cv2.line(img, (x + w, y + h), (x + w - length, y + h), color, thickness, cv2.LINE_AA)
+    cv2.line(img, (x + w, y + h), (x + w, y + h - length), color, thickness, cv2.LINE_AA)
+
+def draw_label_box(img, text, x, y, bg_color=(40, 40, 200), text_color=(255, 255, 255), center_x=False):
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.55
+    thickness = 2
+    (text_w, text_h), _ = cv2.getTextSize(text, font, font_scale, thickness)
+    if center_x:
+        x = x - (text_w // 2)
+    x = max(10, min(x, img.shape[1] - text_w - 20))
+    y = max(text_h + 15, y)
+    cv2.rectangle(img, (x, y - text_h - 10), (x + text_w + 10, y + 5), bg_color, -1)
+    cv2.rectangle(img, (x, y - text_h - 10), (x + text_w + 10, y + 5), (255, 255, 255), 1)
+    cv2.putText(img, text, (x + 5, y - 5), font, font_scale, text_color, thickness, cv2.LINE_AA)
+
+def draw_multiline_label(img, lines, x, y, bg_color=(20, 20, 20), text_color=(255, 255, 255)):
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.5
+    thickness = 1
+    line_gap = 6
+    sizes = [cv2.getTextSize(line, font, font_scale, thickness)[0] for line in lines]
+    max_w = max(w for w, h in sizes)
+    line_h = max(h for w, h in sizes)
+    total_h = (line_h + line_gap) * len(lines) + line_gap
+    x = max(5, min(x, img.shape[1] - max_w - 20))
+    y = max(0, min(y, img.shape[0] - total_h - 5))
+    cv2.rectangle(img, (x, y), (x + max_w + 15, y + total_h), bg_color, -1)
+    cv2.rectangle(img, (x, y), (x + max_w + 15, y + total_h), (255, 255, 255), 1)
+    cur_y = y + line_gap + line_h
+    for line in lines:
+        cv2.putText(img, line, (x + 7, cur_y), font, font_scale, text_color, thickness, cv2.LINE_AA)
+        cur_y += line_h + line_gap
+
+def draw_verdict_banner(img, passed, reasons):
+    h, w = img.shape[:2]
+    banner_h = 55
+    color = (0, 170, 0) if passed else (0, 0, 200)
+    text = "PASS - PART OK" if passed else "FAIL - DEFECT DETECTED"
+    cv2.rectangle(img, (0, 0), (w, banner_h), color, -1)
+    cv2.putText(img, text, (15, 38), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+    if reasons:
+        y = banner_h + 25
+        for reason in reasons:
+            cv2.putText(img, f"- {reason}", (15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 1, cv2.LINE_AA)
+            y += 22
+
+def draw_dashboard(img):
+    """Production counter dashboard, drawn in the top-right corner."""
+    h, w = img.shape[:2]
+    lines = [
+        f"Total Parts: {production_stats['total']}",
+        f"PASS: {production_stats['pass']}",
+        f"FAIL: {production_stats['fail']}",
+        f"Efficiency: {efficiency_percent():.1f}%",
+    ]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.5
+    thickness = 1
+    sizes = [cv2.getTextSize(l, font, font_scale, thickness)[0] for l in lines]
+    max_w = max(s[0] for s in sizes)
+    line_h = sizes[0][1]
+    line_gap = 8
+    box_h = (line_h + line_gap) * len(lines) + line_gap
+    box_w = max_w + 20
+    x = w - box_w - 10
+    y = 110
+    cv2.rectangle(img, (x, y), (x + box_w, y + box_h), (20, 20, 20), -1)
+    cv2.rectangle(img, (x, y), (x + box_w, y + box_h), (0, 255, 255), 1)
+    cur_y = y + line_gap + line_h
+    for line in lines:
+        cv2.putText(img, line, (x + 10, cur_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+        cur_y += line_h + line_gap
+
+# ----------------------------------------------------
+# COLOR DETECTION
+# ----------------------------------------------------
+def detect_color(frame, c):
+    mask = np.zeros(frame.shape[:2], dtype="uint8")
+    cv2.drawContours(mask, [c], -1, 255, -1)
+    hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    mean_hsv = cv2.mean(hsv_frame, mask=mask)[:3]
+    h, s, v = mean_hsv
+    if s < 40 and v > 180:
+        return "White"
+    elif v < 50:
+        return "Black"
+    elif s < 50:
+        return "Gray"
+    if h < 10 or h > 165:
+        return "Red"
+    elif h < 22:
+        return "Orange"
+    elif h < 35:
+        return "Yellow"
+    elif h < 85:
+        return "Green"
+    elif h < 135:
+        return "Blue"
+    else:
+        return "Purple"
+
+# ----------------------------------------------------
+# SHAPE ANALYSIS (shape, vertices, solidity all in one pass)
+# ----------------------------------------------------
+def analyze_contour(c):
+    """Returns {'shape', 'vertices', 'solidity'} for a contour."""
+    peri = cv2.arcLength(c, True)
+    approx = cv2.approxPolyDP(c, APPROX_EPSILON_RATIO * peri, True)
+    area = cv2.contourArea(c)
+    (x, y, w, h) = cv2.boundingRect(approx)
+    hull = cv2.convexHull(c)
+    hull_area = cv2.contourArea(hull)
+    solidity = area / float(hull_area) if hull_area > 0 else 0
+    n = len(approx)
+
+    shape = "Unknown"
+    if n == 3:
+        shape = "Triangle"
+    elif n == 4:
+        rect = cv2.minAreaRect(c)
+        angle = rect[2]
+        tilt = angle % 90
+        tilt = min(tilt, 90 - tilt)
+        if tilt > 20:
+            shape = "Diamond"
+        else:
+            ar = w / float(h) if h != 0 else 0
+            shape = "Square" if SQUARE_ASPECT_LOW <= ar <= SQUARE_ASPECT_HIGH else "Rectangle"
+    elif n == 5 and solidity > 0.85:
+        shape = "Pentagon"
+    elif n == 6 and solidity > 0.85:
+        shape = "Hexagon"
+    else:
+        if solidity > SOLIDITY_CIRCLE:
+            shape = "Circle"
+        elif SOLIDITY_HEART_LOW < solidity <= SOLIDITY_CIRCLE:
+            shape = "Heart"
+        else:
+            shape = "Star"
+
+    return {"shape": shape, "vertices": n, "solidity": solidity}
+
+def detect_shape(c):
+    return analyze_contour(c)["shape"]
+
+# ----------------------------------------------------
+# AI-STYLE SHAPE CONFIDENCE (heuristic, not a trained model)
+# ----------------------------------------------------
+SHAPE_TEMPLATES = {
+    "Triangle": (3, 0.99), "Square": (4, 0.99), "Rectangle": (4, 0.92),
+    "Diamond": (4, 0.90), "Pentagon": (5, 0.92), "Hexagon": (6, 0.92),
+    "Circle": (10, 0.97), "Heart": (8, 0.80), "Star": (10, 0.55),
+}
+
+def shape_confidence_scores(vertices, solidity, top_n=3):
+    """Heuristic 'AI-style' confidence: scores each known shape template
+    by how close this contour's vertex count and solidity are to that
+    template, then normalizes into percentages. This is NOT a trained
+    classifier -- it's a geometric similarity score dressed up as one.
+    """
+    scores = {}
+    for name, (tv, tsol) in SHAPE_TEMPLATES.items():
+        vertex_term = math.exp(-((vertices - tv) ** 2) / 8.0)
+        solidity_term = math.exp(-((solidity - tsol) ** 2) / 0.02)
+        scores[name] = vertex_term * solidity_term
+
+    total = sum(scores.values()) or 1e-9
+    pct = {k: (v / total) * 100 for k, v in scores.items()}
+    ranked = sorted(pct.items(), key=lambda kv: kv[1], reverse=True)
+    return ranked[:top_n]
+
+# ----------------------------------------------------
+# REAL-WORLD MEASUREMENT (pixel -> cm conversion)
+# ----------------------------------------------------
+def get_shape_dims(shape_name, c):
+    """Raw pixel dimensions for a contour."""
+    area = cv2.contourArea(c)
+    perimeter = cv2.arcLength(c, True)
+    dims = {"area": area, "perimeter": perimeter}
+
+    if shape_name == "Circle":
+        radius = np.sqrt(area / np.pi)
+        dims["radius"] = radius
+        dims["diameter"] = radius * 2
+    elif shape_name == "Square":
+        dims["side"] = perimeter / 4.0
+    elif shape_name in ("Rectangle", "Diamond"):
+        rect = cv2.minAreaRect(c)
+        (rw, rh) = rect[1]
+        dims["width"] = max(rw, rh)
+        dims["height"] = min(rw, rh)
+    elif shape_name == "Triangle":
+        dims["avg_side"] = perimeter / 3.0
+    elif shape_name == "Pentagon":
+        dims["avg_side"] = perimeter / 5.0
+    elif shape_name == "Hexagon":
+        dims["avg_side"] = perimeter / 6.0
+
+    return dims
+
+def dims_to_lines(dims):
+    """Converts a pixel-dims dict into display-ready strings, in real
+    units (cm) if calibrated, otherwise pixels."""
+    label_map = {
+        "radius": "Radius", "diameter": "Diameter", "side": "Side",
+        "width": "Width", "height": "Height", "avg_side": "Avg side",
+        "perimeter": "Perimeter", "area": "Area",
+    }
+    calibrated = PIXELS_PER_UNIT is not None
+    lines = []
+    for key in ("radius", "diameter", "side", "width", "height", "avg_side"):
+        if key in dims:
+            if calibrated:
+                val = dims[key] / PIXELS_PER_UNIT
+                lines.append(f"{label_map[key]}: {val:.2f}{UNIT_NAME}")
+            else:
+                lines.append(f"{label_map[key]}: {dims[key]:.1f}px")
+
+    if calibrated:
+        lines.append(f"Perimeter: {dims['perimeter'] / PIXELS_PER_UNIT:.2f}{UNIT_NAME}")
+        lines.append(f"Area: {dims['area'] / (PIXELS_PER_UNIT ** 2):.2f}{UNIT_NAME}^2")
+    else:
+        lines.append(f"Perimeter: {dims['perimeter']:.1f}px")
+        lines.append(f"Area: {dims['area']:.0f}px^2")
+    return lines
+
+def calibrate_from_profile(profile):
+    pass  # calibration removed — measurements stay in pixels
+
+# ----------------------------------------------------
+# CONTOUR DETECTION (with hierarchy, for hole counting)
+# ----------------------------------------------------
+def find_contours_with_hierarchy(gray):
+    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+    edges = cv2.Canny(blurred, CANNY_LOW, CANNY_HIGH)
+    kernel = np.ones((3, 3), np.uint8)
+    closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+    dilated = cv2.dilate(closed, kernel, iterations=2)
+    contours, hierarchy = cv2.findContours(dilated.copy(), cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    if hierarchy is None:
+        hierarchy = np.empty((0, 1, 4), dtype=int)
+    else:
+        hierarchy = hierarchy[0]  # cv2 wraps it in an extra dim
+    return contours, hierarchy
+
+def count_holes(contours, hierarchy, parent_idx):
+    """Counts child contours (holes) of a given parent index, ignoring
+    tiny noise specks below MIN_HOLE_AREA."""
+    count = 0
+    for i, h in enumerate(hierarchy):
+        if h[3] == parent_idx and cv2.contourArea(contours[i]) > MIN_HOLE_AREA:
+            count += 1
+    return count
+
+# ----------------------------------------------------
+# LIVE-CAMERA ANNOTATION (with object tracking)
+# ----------------------------------------------------
+class ObjectTracker:
+    """Minimal nearest-centroid tracker: assigns a stable ID to each
+    object across frames as long as it doesn't move more than
+    max_distance pixels between frames."""
+    def __init__(self, max_distance=60):
+        self.next_id = 1
+        self.objects = {}  # id -> (x, y)
+        self.max_distance = max_distance
+
+    def update(self, centroids):
+        used_ids = set()
+        new_objects = {}
+        ids_for_input = []
+
+        for c in centroids:
+            best_id, best_dist = None, self.max_distance
+            for oid, prev_c in self.objects.items():
+                if oid in used_ids:
+                    continue
+                d = math.hypot(c[0] - prev_c[0], c[1] - prev_c[1])
+                if d < best_dist:
+                    best_dist = d
+                    best_id = oid
+            if best_id is None:
+                best_id = self.next_id
+                self.next_id += 1
+            used_ids.add(best_id)
+            new_objects[best_id] = c
+            ids_for_input.append(best_id)
+
+        self.objects = new_objects
+        return ids_for_input
+
+def annotate_shapes(img, target_shape="All", show_measurements=False, tracker=None):
+    """Detects and labels every matching shape in img. If a tracker is
+    given, also assigns/draws a stable Object ID per shape."""
+    height, width = img.shape[:2]
+    frame_area = height * width
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    contours, hierarchy = find_contours_with_hierarchy(gray)
+
+    # Collect valid OUTER objects first (parent == -1 in RETR_CCOMP)
+    objects = []
+    for i, c in enumerate(contours):
+        if hierarchy[i][3] != -1:
+            continue  # this is a hole, not an outer object
+        area = cv2.contourArea(c)
+        if not (MIN_CONTOUR_AREA < area < (frame_area * MAX_CONTOUR_AREA_RATIO)):
+            continue
+
+        features = analyze_contour(c)
+        shape_name = features["shape"]
+        if target_shape != "All" and shape_name != target_shape:
+            continue
+
+        M = cv2.moments(c)
+        cX = int(M["m10"] / M["m00"]) if M["m00"] != 0 else 0
+        cY = int(M["m01"] / M["m00"]) if M["m00"] != 0 else 0
+
+        objects.append({"contour": c, "shape": shape_name, "area": area, "cX": cX, "cY": cY})
+
+    # Object tracking: assign stable IDs based on centroid proximity
+    ids = None
+    if tracker is not None and objects:
+        ids = tracker.update([(o["cX"], o["cY"]) for o in objects])
+
+    for idx, o in enumerate(objects):
+        c = o["contour"]
+        shape_name = o["shape"]
+        percentage = (o["area"] / frame_area) * 100
+        color_name = detect_color(img, c)
+
+        cv2.drawContours(img, [c], -1, (0, 255, 0), 3, cv2.LINE_AA)
+
+        label = f"{color_name} {shape_name} ({percentage:.1f}%)"
+        draw_label_box(img, label, o["cX"], o["cY"],
+                        bg_color=(40, 150, 40), text_color=(255, 255, 255), center_x=True)
+
+        if ids is not None:
+            draw_label_box(img, f"ID: {ids[idx]}", o["cX"], o["cY"] - 35,
+                            bg_color=(150, 80, 0), text_color=(255, 255, 255), center_x=True)
+
+        if show_measurements:
+            dims = get_shape_dims(shape_name, c)
+            draw_multiline_label(img, dims_to_lines(dims), o["cX"] - 60, o["cY"] + 25,
+                                  bg_color=(60, 40, 40), text_color=(255, 255, 255))
+
+    return img
+
+# ----------------------------------------------------
+# PRIMARY-OBJECT EXTRACTION (for QC reference/compare)
+# ----------------------------------------------------
+def find_primary_object(img):
+    """Assumes ONE part per image: the largest valid outer contour.
+    Returns a full profile dict (incl. holes, vertices, solidity), or
+    None if nothing found.
+    """
+    height, width = img.shape[:2]
+    frame_area = height * width
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    contours, hierarchy = find_contours_with_hierarchy(gray)
+
+    candidates = []
+    for i, c in enumerate(contours):
+        if hierarchy[i][3] != -1:
+            continue
+        area = cv2.contourArea(c)
+        if MIN_CONTOUR_AREA < area < (frame_area * MAX_CONTOUR_AREA_RATIO):
+            candidates.append((i, c, area))
+
+    if not candidates:
+        return None
+
+    idx, c, area = max(candidates, key=lambda t: t[2])
+    features = analyze_contour(c)
+    shape_name = features["shape"]
+    color_name = detect_color(img, c)
+    dims = get_shape_dims(shape_name, c)
+    holes = count_holes(contours, hierarchy, idx)
+
+    M = cv2.moments(c)
+    cX = int(M["m10"] / M["m00"]) if M["m00"] != 0 else 0
+    cY = int(M["m01"] / M["m00"]) if M["m00"] != 0 else 0
+
+    return {
+        "contour": c, "shape": shape_name, "color": color_name, "dims": dims,
+        "vertices": features["vertices"], "solidity": features["solidity"],
+        "holes": holes, "centroid": (cX, cY),
+    }
+
+# ----------------------------------------------------
+# CONTOUR-LEVEL SHAPE DIFF (catches local/structural defects that
+# vertex-count, solidity, and bounding-box checks miss)
+# ----------------------------------------------------
+def align_and_rasterize(contour, centroid, canvas_size=SHAPE_DIFF_CANVAS):
+    """Shifts a contour so its centroid sits at the center of a square
+    canvas, then rasterizes it into a filled binary mask. Aligning by
+    centroid means two parts of the same size/shape overlap almost
+    perfectly regardless of where they were positioned in their photo."""
+    offset = canvas_size // 2
+    shifted = contour.reshape(-1, 2).astype(np.int32) - np.array(centroid, dtype=np.int32) + offset
+    mask = np.zeros((canvas_size, canvas_size), dtype=np.uint8)
+    cv2.drawContours(mask, [shifted], -1, 255, -1)
+    return mask
+
+def compute_contour_shape_diff(ref_contour, ref_centroid, test_contour, test_centroid):
+    """Aligns the reference and test contours by centroid and rasterizes
+    both into filled masks, then measures how much of their combined
+    outline area does NOT overlap. This is what actually catches things
+    like a missing/extra notch, a chipped edge, or a deformed tab --
+    differences that can leave vertex count, solidity, and width/height
+    almost completely unchanged, and therefore invisible to the other
+    checks below.
+
+    Returns (diff_ratio, visual_bgr_image):
+      diff_ratio       -- fraction (0-1) of the union area that differs
+      visual_bgr_image -- an image with matching area in gray, area
+                           present only in the reference in RED (i.e.
+                           missing on the test part), and area present
+                           only on the test part in YELLOW (i.e. extra
+                           material on the test part)
+    """
+    ref_mask = align_and_rasterize(ref_contour, ref_centroid)
+    test_mask = align_and_rasterize(test_contour, test_centroid)
+
+    only_ref = cv2.bitwise_and(ref_mask, cv2.bitwise_not(test_mask))
+    only_test = cv2.bitwise_and(test_mask, cv2.bitwise_not(ref_mask))
+    overlap = cv2.bitwise_and(ref_mask, test_mask)
+
+    union_area = cv2.countNonZero(cv2.bitwise_or(ref_mask, test_mask))
+    diff_area = cv2.countNonZero(only_ref) + cv2.countNonZero(only_test)
+    diff_ratio = (diff_area / union_area) if union_area > 0 else 0.0
+
+    visual = np.zeros((ref_mask.shape[0], ref_mask.shape[1], 3), dtype=np.uint8)
+    visual[overlap > 0] = (90, 90, 90)     # matches reference -> gray
+    visual[only_ref > 0] = (0, 0, 255)     # missing on test part -> red
+    visual[only_test > 0] = (0, 255, 255)  # extra on test part -> yellow
+
+    # crop down to the union's bounding box (+ padding) so the popup
+    # window isn't mostly empty canvas
+    ys, xs = np.where(cv2.bitwise_or(ref_mask, test_mask) > 0)
+    if len(xs) > 0:
+        pad = 25
+        x0, x1 = max(int(xs.min()) - pad, 0), min(int(xs.max()) + pad, visual.shape[1])
+        y0, y1 = max(int(ys.min()) - pad, 0), min(int(ys.max()) + pad, visual.shape[0])
+        visual = visual[y0:y1, x0:x1]
+
+    return diff_ratio, visual
+
+# ----------------------------------------------------
+# QC COMPARISON (now with defect detection)
+# ----------------------------------------------------
+def compare_to_reference(reference, test):
+    """Compares a test-part profile against the reference profile.
+    Returns (passed, reasons, diff_visual).
+
+    Checks performed:
+      1. Shape match (wrong shape entirely)
+      2. Hole count match (extra/missing holes)
+      3. Vertex count match (broken/missing corners)
+      4. Solidity drop (deformed/broken shape outline)
+      5. Contour outline diff (local/structural defects -- notches,
+         chips, added or missing material -- via centroid-aligned mask
+         overlap; catches changes that 1-4 and the dimension check
+         below can miss entirely)
+      6. Dimension match within SIZE_TOLERANCE_PERCENT (real or pixel units)
+    """
+    reasons = []
+    diff_visual = None
+
+    if test["shape"] != reference["shape"]:
+        reasons.append(f"Shape mismatch: expected {reference['shape']}, got {test['shape']}")
+        return False, reasons
+
+    if test["holes"] != reference["holes"]:
+        if test["holes"] > reference["holes"]:
+            reasons.append(f"Extra hole(s) detected: expected {reference['holes']}, found {test['holes']}")
+        else:
+            reasons.append(f"Missing hole(s): expected {reference['holes']}, found {test['holes']}")
+
+    vertex_diff = abs(test["vertices"] - reference["vertices"])
+    if vertex_diff > VERTEX_DIFF_TOLERANCE:
+        reasons.append(
+            f"Possible broken/missing corner: expected ~{reference['vertices']} corners, "
+            f"got {test['vertices']}"
+        )
+
+    solidity_drop = reference["solidity"] - test["solidity"]
+    if solidity_drop > SOLIDITY_DROP_TOLERANCE:
+        reasons.append(
+            f"Shape appears broken/deformed (solidity dropped {solidity_drop:.2f})"
+        )
+
+    # Contour-level outline check -- catches local defects (notches,
+    # chipped edges, extra tabs, etc.) that vertex count, solidity, and
+    # aggregate dimensions can all miss when the overall size/shape
+    # "on average" still looks right.
+    diff_ratio, diff_visual = compute_contour_shape_diff(
+        reference["contour"], reference["centroid"],
+        test["contour"], test["centroid"],
+    )
+    print(f"  contour outline diff: {diff_ratio * 100:.2f}%")
+    if diff_ratio > SHAPE_DIFF_TOLERANCE:
+        reasons.append(
+            f"Contour outline differs from reference by {diff_ratio * 100:.1f}% "
+            f"(possible notch, chip, or added/missing material -- see contour diff view)"
+        )
+
+    ref_dims = reference["dims"]
+    test_dims = test["dims"]
+    shared_keys = [k for k in ref_dims if k in test_dims and k != "perimeter"]
+    for key in shared_keys:
+        ref_val = ref_dims[key]
+        test_val = test_dims[key]
+        if ref_val == 0:
+            continue
+        pct_diff = abs(test_val - ref_val) / ref_val * 100
+        print(f"  {key}: ref={ref_val:.1f}px test={test_val:.1f}px diff={pct_diff:.3f}%")
+        if pct_diff > SIZE_TOLERANCE_PERCENT:
+            unit = UNIT_NAME if PIXELS_PER_UNIT else "px"
+            rv = ref_val / PIXELS_PER_UNIT if PIXELS_PER_UNIT else ref_val
+            tv = test_val / PIXELS_PER_UNIT if PIXELS_PER_UNIT else test_val
+            reasons.append(
+                f"{key.capitalize()} off by {pct_diff:.1f}% "
+                f"(expected {rv:.2f}{unit}, got {tv:.2f}{unit})"
+            )
+
+    passed = len(reasons) == 0
+    return passed, reasons, diff_visual
+
+# ----------------------------------------------------
+# CAMERA HELPERS
+# ----------------------------------------------------
+def open_camera(max_index=3):
+    system = platform.system()
+    if system == "Windows":
+        backend = cv2.CAP_DSHOW
+    elif system == "Linux":
+        backend = cv2.CAP_V4L2
+    else:
+        backend = cv2.CAP_ANY
+
+    for i in range(max_index):
+        cap = cv2.VideoCapture(i, backend)
+        if not cap.isOpened():
+            cap.release()
+            cap = cv2.VideoCapture(i)
+        if cap.isOpened():
+            ret, frame = cap.read()
+            if ret and np.any(frame):
+                print(f"Successfully connected to Camera {i}!")
+                return cap
+        cap.release()
+    return None
+
+# ----------------------------------------------------
+# IMAGE FILE HELPERS
+# ----------------------------------------------------
+def pick_image_file():
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    path = filedialog.askopenfilename(
+        title="Select an image",
+        filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp *.webp"), ("All files", "*.*")]
+    )
+    root.destroy()
+    return path or None
+
+def pick_image_files_multi():
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    paths = filedialog.askopenfilenames(
+        title="Select one or more produced-part images",
+        filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp *.webp"), ("All files", "*.*")]
+    )
+    root.destroy()
+    return list(paths)
+
+def resize_to_fit(img, max_dim=MAX_UPLOADED_IMAGE_DIM):
+    h, w = img.shape[:2]
+    scale = max_dim / float(max(h, w))
+    if scale < 1.0:
+        img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    return img
+
+# ----------------------------------------------------
+# QC WORKFLOW MODES
+# ----------------------------------------------------
+def run_set_reference_mode():
+    """Upload the ORIGINAL/correct part image, store its full profile as
+    the reference, and (optionally) calibrate pixel-to-cm conversion.
+    """
+    path = pick_image_file()
+    if not path:
+        print("No reference image selected.")
+        return None
+
+    img = cv2.imread(path)
+    if img is None:
+        print(f"ERROR: Could not read image at {path}")
+        return None
+
+    img = resize_to_fit(img)
+    profile = find_primary_object(img)
+
+    if profile is None:
+        print("Could not detect any object in the reference image.")
+        cv2.imshow("Reference - NO OBJECT DETECTED", img)
+        cv2.waitKey(0)
+        cv2.destroyWindow("Reference - NO OBJECT DETECTED")
+        return None
+
+    calibrate_from_profile(profile)
+
+    display = img.copy()
+    cv2.drawContours(display, [profile["contour"]], -1, (0, 255, 255), 3, cv2.LINE_AA)
+    label = f"REFERENCE: {profile['color']} {profile['shape']} | Holes: {profile['holes']}"
+    draw_label_box(display, label, profile["centroid"][0], profile["centroid"][1],
+                    bg_color=(0, 150, 200), text_color=(0, 0, 0), center_x=True)
+    draw_multiline_label(display, dims_to_lines(profile["dims"]),
+                          profile["centroid"][0] - 60, profile["centroid"][1] + 25,
+                          bg_color=(60, 40, 40))
+    cv2.putText(display, "Reference set. Press any key to continue...", (15, display.shape[0] - 15),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+
+    cv2.imshow("Reference Part", display)
+    cv2.waitKey(0)
+    cv2.destroyWindow("Reference Part")
+
+    print(f"Reference set: {profile['color']} {profile['shape']} | holes={profile['holes']} | {dims_to_lines(profile['dims'])}")
+    return profile
+
+def run_compare_mode(reference):
+    """Upload one or more PRODUCED part images, compare each against the
+    reference (shape, holes, corners, solidity, size), show a PASS/FAIL
+    verdict, log it to CSV, save a screenshot if it failed, and update
+    the production dashboard.
+    """
+    if reference is None:
+        print("No reference set yet. Press SHIFT+R first.")
+        return
+
+    paths = pick_image_files_multi()
+    if not paths:
+        print("No images selected for comparison.")
+        return
+
+    for path in paths:
+        img = cv2.imread(path)
+        if img is None:
+            print(f"ERROR: Could not read image at {path}")
+            continue
+
+        img = resize_to_fit(img)
+        test_profile = find_primary_object(img)
+        display = img.copy()
+
+        if test_profile is None:
+            passed = False
+            reasons = ["No object detected in image"]
+            draw_verdict_banner(display, passed, reasons)
+            record_result(passed)
+            log_csv_row("Unknown", "Unknown", "FAIL", reasons, path)
+            saved_path = save_defect_screenshot(display)
+            print(f"Defect screenshot saved: {saved_path}")
+        else:
+            print(f"\nComparing: {path}")
+            passed, reasons, diff_visual = compare_to_reference(reference, test_profile)
+
+            # AI-style confidence readout
+            top_shapes = shape_confidence_scores(test_profile["vertices"], test_profile["solidity"])
+            confidence_lines = [f"{name}: {pct:.0f}%" for name, pct in top_shapes]
+
+            cv2.drawContours(display, [test_profile["contour"]], -1,
+                              (0, 255, 0) if passed else (0, 0, 255), 3, cv2.LINE_AA)
+            draw_verdict_banner(display, passed, reasons)
+            draw_multiline_label(display, dims_to_lines(test_profile["dims"]),
+                                  test_profile["centroid"][0] - 60, test_profile["centroid"][1] + 25,
+                                  bg_color=(60, 40, 40))
+            draw_multiline_label(display, confidence_lines,
+                                  test_profile["centroid"][0] - 60, test_profile["centroid"][1] + 110,
+                                  bg_color=(80, 20, 80))
+
+            record_result(passed)
+            log_csv_row(test_profile["shape"], test_profile["color"],
+                        "PASS" if passed else "FAIL", reasons, path)
+
+            if not passed:
+                saved_path = save_defect_screenshot(display)
+                print(f"Defect screenshot saved: {saved_path}")
+                if diff_visual is not None:
+                    diff_path = os.path.join(DEFECT_DIR, f"defect_{production_stats['fail']}_diff.png")
+                    cv2.imwrite(diff_path, diff_visual)
+                    print(f"Contour diff image saved: {diff_path}")
+                    cv2.imshow("Contour Diff (red=missing, yellow=extra)", diff_visual)
+
+        draw_dashboard(display)
+        cv2.putText(display, "Press any key for next image...", (15, display.shape[0] - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+        cv2.imshow("QC Result", display)
+        cv2.waitKey(0)
+        cv2.destroyWindow("QC Result")
+        try:
+            cv2.destroyWindow("Contour Diff (red=missing, yellow=extra)")
+        except cv2.error:
+            pass
+
+    print("\n--- PRODUCTION DASHBOARD ---")
+    print(f"Total Parts: {production_stats['total']}")
+    print(f"PASS: {production_stats['pass']}")
+    print(f"FAIL: {production_stats['fail']}")
+    print(f"Efficiency: {efficiency_percent():.1f}%")
+    print(f"Full report: {os.path.abspath(CSV_PATH)}\n")
+
+# ----------------------------------------------------
+# MAIN APPLICATION
+# ----------------------------------------------------
+def main():
+    print("Initializing camera... This might take a few seconds.")
+    init_csv_report()
+
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+    cap = open_camera()
+    if cap is None:
+        print("\nERROR: Could not find a working camera.")
+        return
+
+    print("Press 'q' to quit.")
+    print("Press SHIFT+R to upload the REFERENCE (original/correct) part image.")
+    print("Press SHIFT+C to upload and COMPARE produced-part image(s) against the reference.")
+    target_shape = "All"
+    reference_profile = None
+    tracker = ObjectTracker()
+
+    consecutive_failed_reads = 0
+    MAX_FAILED_READS = 10
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            consecutive_failed_reads += 1
+            if consecutive_failed_reads >= MAX_FAILED_READS:
+                print("\nERROR: Camera stopped responding.")
+                break
+            continue
+        consecutive_failed_reads = 0
+
+        height, width, _ = frame.shape
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        if target_shape in ("All", "Human"):
+            faces = face_cascade.detectMultiScale(
+                gray, scaleFactor=FACE_SCALE_FACTOR,
+                minNeighbors=FACE_MIN_NEIGHBORS, minSize=FACE_MIN_SIZE,
+            )
+            for (x, y, w, h) in faces:
+                draw_target_box(frame, x, y, w, h, color=(0, 255, 255))
+                draw_label_box(frame, "HUMAN DETECTED", x, y - 5,
+                                bg_color=(0, 200, 200), text_color=(0, 0, 0))
+
+        if target_shape != "Human":
+            annotate_shapes(frame, target_shape=target_shape, show_measurements=False, tracker=tracker)
+
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, 0), (width, 100), (20, 20, 20), -1)
+        cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+
+        cv2.putText(frame, "TARGET MODE:", (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 200, 200), 1, cv2.LINE_AA)
+        cv2.putText(frame, target_shape.upper(), (175, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
+
+        ref_status = "SET" if reference_profile else "NOT SET"
+        ref_color = (0, 255, 0) if reference_profile else (0, 0, 255)
+        cv2.putText(frame, f"QC REFERENCE: {ref_status}", (width - 260, 35),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, ref_color, 2, cv2.LINE_AA)
+
+        inst1 = "KEYS: [A]ll | [T]riangle | [S]quare | [Rect]angle | [P]entagon | [Circ]le"
+        inst2 = "      [D]iamond | [H]eart | [*]Star | [U]Human | SHIFT+[R]=Set Ref | SHIFT+[C]=Compare | [Q]uit"
+        cv2.putText(frame, inst1, (15, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
+        cv2.putText(frame, inst2, (15, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
+
+        draw_dashboard(frame)
+
+        cv2.imshow("Shape Detection Pro - QC Mode", frame)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord('R'):
+            reference_profile = run_set_reference_mode()
+            continue
+        elif key == ord('C'):
+            run_compare_mode(reference_profile)
+            continue
+
+        key_char = chr(key) if 0 <= key < 256 else ''
+        if key_char in KEY_TO_SHAPE:
+            target_shape = KEY_TO_SHAPE[key_char]
+
+    cap.release()
+    cv2.destroyAllWindows()
+    print("\n--- FINAL SESSION SUMMARY ---")
+    print(f"Total Parts: {production_stats['total']}")
+    print(f"PASS: {production_stats['pass']}")
+    print(f"FAIL: {production_stats['fail']}")
+    print(f"Efficiency: {efficiency_percent():.1f}%")
+    print(f"CSV report: {os.path.abspath(CSV_PATH)}")
+    print(f"Defect screenshots: {os.path.abspath(DEFECT_DIR)}")
+
+if __name__ == "__main__":
+    main()
